@@ -21,17 +21,21 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
+import java.nio.channels.CompletionHandler;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
+
+import javax.net.ssl.KeyManager;
 
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
@@ -43,7 +47,6 @@ import org.apache.tomcat.jni.OS;
 import org.apache.tomcat.jni.Poll;
 import org.apache.tomcat.jni.Pool;
 import org.apache.tomcat.jni.SSL;
-import org.apache.tomcat.jni.SSLConf;
 import org.apache.tomcat.jni.SSLContext;
 import org.apache.tomcat.jni.SSLContext.SNICallBack;
 import org.apache.tomcat.jni.SSLSocket;
@@ -55,9 +58,8 @@ import org.apache.tomcat.util.buf.ByteBufferUtils;
 import org.apache.tomcat.util.collections.SynchronizedStack;
 import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
 import org.apache.tomcat.util.net.Acceptor.AcceptorState;
-import org.apache.tomcat.util.net.SSLHostConfig.Type;
-import org.apache.tomcat.util.net.openssl.OpenSSLConf;
-import org.apache.tomcat.util.net.openssl.OpenSSLEngine;
+import org.apache.tomcat.util.net.openssl.OpenSSLContext;
+import org.apache.tomcat.util.net.openssl.OpenSSLUtil;
 
 
 /**
@@ -116,6 +118,11 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
         // Need to override the default for maxConnections to align it with what
         // was pollerSize (before the two were merged)
         setMaxConnections(8 * 1024);
+        // Asynchronous IO has significantly lower performance with APR:
+        // - no IO vectoring
+        // - mandatory use of direct buffers causing required output buffering
+        // - needs extra output flushes due to the buffering
+        setUseAsyncIO(false);
     }
 
     // ------------------------------------------------------------- Properties
@@ -188,12 +195,6 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
     protected Sendfile sendfile = null;
     public Sendfile getSendfile() {
         return sendfile;
-    }
-
-
-    @Override
-    protected Type getSslConfigType() {
-        return SSLHostConfig.Type.OPENSSL;
     }
 
 
@@ -353,12 +354,6 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
             setUseSendfileInternal(false);
         }
 
-        // Initialize thread count default for acceptor
-        if (acceptorThreadCount == 0) {
-            // FIXME: Doesn't seem to work that well with multiple accept threads
-            acceptorThreadCount = 1;
-        }
-
         // Delay accepting of new connections until data is available
         // Only Linux kernels 2.4 + have that implemented
         // on other platforms this call is noop and will return APR_ENOTIMPL.
@@ -371,7 +366,6 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
         // Initialize SSL if needed
         if (isSSLEnabled()) {
             for (SSLHostConfig sslHostConfig : sslHostConfigs.values()) {
-                sslHostConfig.setConfigType(getSslConfigType());
                 createSSLContext(sslHostConfig);
             }
             SSLHostConfig defaultSSLHostConfig = sslHostConfigs.get(getDefaultSSLHostConfigName());
@@ -382,6 +376,14 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
             Long defaultSSLContext = defaultSSLHostConfig.getOpenSslContext();
             sslContext = defaultSSLContext.longValue();
             SSLContext.registerDefault(defaultSSLContext, this);
+
+            // For now, sendfile is not supported with SSL
+            if (getUseSendfile()) {
+                setUseSendfileInternal(false);
+                if (useSendFileSet) {
+                    log.warn(sm.getString("endpoint.apr.noSendfileWithSSL"));
+                }
+            }
         }
     }
 
@@ -389,251 +391,32 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
     @Override
     protected void createSSLContext(SSLHostConfig sslHostConfig) throws Exception {
+        OpenSSLContext sslContext = null;
         Set<SSLHostConfigCertificate> certificates = sslHostConfig.getCertificates(true);
-        boolean firstCertificate = true;
         for (SSLHostConfigCertificate certificate : certificates) {
-            if (SSLHostConfig.adjustRelativePath(certificate.getCertificateFile()) == null) {
-                // This is required
-                throw new Exception(sm.getString("endpoint.apr.noSslCertFile"));
+            if (sslContext == null) {
+                SSLUtil sslUtil = new OpenSSLUtil(certificate);
+                sslHostConfig.setEnabledProtocols(sslUtil.getEnabledProtocols());
+                sslHostConfig.setEnabledCiphers(sslUtil.getEnabledCiphers());
+
+                try {
+                    sslContext = (OpenSSLContext) sslUtil.createSSLContext(negotiableProtocols);
+                } catch (Exception e) {
+                    throw new IllegalArgumentException(e.getMessage(), e);
+                }
+            } else {
+                SSLUtil sslUtil = new OpenSSLUtil(certificate);
+                KeyManager[] kms = sslUtil.getKeyManagers();
+                certificate.setCertificateKeyManager(OpenSSLUtil.chooseKeyManager(kms));
+                sslContext.addCertificate(certificate);
             }
-            if (firstCertificate) {
-                // TODO: Duplicates code in SSLUtilBase. Consider
-                //       refactoring to reduce duplication
-                firstCertificate = false;
-                // Configure the enabled protocols
-                List<String> enabledProtocols = SSLUtilBase.getEnabled("protocols", log,
-                        true, sslHostConfig.getProtocols(),
-                        OpenSSLEngine.IMPLEMENTED_PROTOCOLS_SET);
-                sslHostConfig.setEnabledProtocols(
-                        enabledProtocols.toArray(new String[enabledProtocols.size()]));
-                // Configure the enabled ciphers
-                List<String> enabledCiphers = SSLUtilBase.getEnabled("ciphers", log,
-                        false, sslHostConfig.getJsseCipherNames(),
-                        OpenSSLEngine.AVAILABLE_CIPHER_SUITES);
-                sslHostConfig.setEnabledCiphers(
-                        enabledCiphers.toArray(new String[enabledCiphers.size()]));
-            }
+
+            certificate.setSslContext(sslContext);
         }
+
         if (certificates.size() > 2) {
             // TODO: Can this limitation be removed?
             throw new Exception(sm.getString("endpoint.apr.tooManyCertFiles"));
-        }
-
-        // SSL protocol
-        int value = SSL.SSL_PROTOCOL_NONE;
-        if (sslHostConfig.getProtocols().size() == 0) {
-            // Native fallback used if protocols=""
-            value = SSL.SSL_PROTOCOL_ALL;
-        } else {
-            for (String protocol : sslHostConfig.getEnabledProtocols()) {
-                if (Constants.SSL_PROTO_SSLv2Hello.equalsIgnoreCase(protocol)) {
-                    // NO-OP. OpenSSL always supports SSLv2Hello
-                } else if (Constants.SSL_PROTO_SSLv2.equalsIgnoreCase(protocol)) {
-                    value |= SSL.SSL_PROTOCOL_SSLV2;
-                } else if (Constants.SSL_PROTO_SSLv3.equalsIgnoreCase(protocol)) {
-                    value |= SSL.SSL_PROTOCOL_SSLV3;
-                } else if (Constants.SSL_PROTO_TLSv1.equalsIgnoreCase(protocol)) {
-                    value |= SSL.SSL_PROTOCOL_TLSV1;
-                } else if (Constants.SSL_PROTO_TLSv1_1.equalsIgnoreCase(protocol)) {
-                    value |= SSL.SSL_PROTOCOL_TLSV1_1;
-                } else if (Constants.SSL_PROTO_TLSv1_2.equalsIgnoreCase(protocol)) {
-                    value |= SSL.SSL_PROTOCOL_TLSV1_2;
-                } else if (Constants.SSL_PROTO_TLSv1_3.equalsIgnoreCase(protocol)) {
-                    value |= SSL.SSL_PROTOCOL_TLSV1_3;
-                } else {
-                    // Should not happen since filtering to build
-                    // enabled protocols removes invalid values.
-                    throw new Exception(sm.getString(
-                            "endpoint.apr.invalidSslProtocol", protocol));
-                }
-            }
-        }
-
-        // Create SSL Context
-        long ctx = 0;
-        try {
-            ctx = SSLContext.make(rootPool, value, SSL.SSL_MODE_SERVER);
-        } catch (Exception e) {
-            // If the sslEngine is disabled on the AprLifecycleListener
-            // there will be an Exception here but there is no way to check
-            // the AprLifecycleListener settings from here
-            throw new Exception(
-                    sm.getString("endpoint.apr.failSslContextMake"), e);
-        }
-
-        if (sslHostConfig.getInsecureRenegotiation()) {
-            SSLContext.setOptions(ctx, SSL.SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
-        } else {
-            SSLContext.clearOptions(ctx, SSL.SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
-        }
-
-        // Use server's preference order for ciphers (rather than client's)
-        if (sslHostConfig.getHonorCipherOrder()) {
-            SSLContext.setOptions(ctx, SSL.SSL_OP_CIPHER_SERVER_PREFERENCE);
-        } else {
-            SSLContext.clearOptions(ctx, SSL.SSL_OP_CIPHER_SERVER_PREFERENCE);
-        }
-
-        // Disable compression if requested
-        if (sslHostConfig.getDisableCompression()) {
-            SSLContext.setOptions(ctx, SSL.SSL_OP_NO_COMPRESSION);
-        } else {
-            SSLContext.clearOptions(ctx, SSL.SSL_OP_NO_COMPRESSION);
-        }
-
-        // Disable TLS Session Tickets (RFC4507) to protect perfect forward secrecy
-        if (sslHostConfig.getDisableSessionTickets()) {
-            SSLContext.setOptions(ctx, SSL.SSL_OP_NO_TICKET);
-        } else {
-            SSLContext.clearOptions(ctx, SSL.SSL_OP_NO_TICKET);
-        }
-
-        // List the ciphers that the client is permitted to negotiate
-        SSLContext.setCipherSuite(ctx, sslHostConfig.getCiphers());
-        // Load Server key and certificate
-        // TODO: Confirm assumption that idx is not specific to
-        //       key/certificate type
-        int idx = 0;
-        for (SSLHostConfigCertificate certificate : sslHostConfig.getCertificates(true)) {
-            SSLContext.setCertificate(ctx,
-                    SSLHostConfig.adjustRelativePath(certificate.getCertificateFile()),
-                    SSLHostConfig.adjustRelativePath(certificate.getCertificateKeyFile()),
-                    certificate.getCertificateKeyPassword(), idx++);
-            // Set certificate chain file
-            SSLContext.setCertificateChainFile(ctx,
-                    SSLHostConfig.adjustRelativePath(certificate.getCertificateChainFile()), false);
-        }
-        // Support Client Certificates
-        SSLContext.setCACertificate(ctx,
-                SSLHostConfig.adjustRelativePath(sslHostConfig.getCaCertificateFile()),
-                SSLHostConfig.adjustRelativePath(sslHostConfig.getCaCertificatePath()));
-        // Set revocation
-        SSLContext.setCARevocation(ctx,
-                SSLHostConfig.adjustRelativePath(
-                        sslHostConfig.getCertificateRevocationListFile()),
-                SSLHostConfig.adjustRelativePath(
-                        sslHostConfig.getCertificateRevocationListPath()));
-        // Client certificate verification
-        switch (sslHostConfig.getCertificateVerification()) {
-        case NONE:
-            value = SSL.SSL_CVERIFY_NONE;
-            break;
-        case OPTIONAL:
-            value = SSL.SSL_CVERIFY_OPTIONAL;
-            break;
-        case OPTIONAL_NO_CA:
-            value = SSL.SSL_CVERIFY_OPTIONAL_NO_CA;
-            break;
-        case REQUIRED:
-            value = SSL.SSL_CVERIFY_REQUIRE;
-            break;
-        }
-        SSLContext.setVerify(ctx, value, sslHostConfig.getCertificateVerificationDepth());
-        // For now, sendfile is not supported with SSL
-        if (getUseSendfile()) {
-            setUseSendfileInternal(false);
-            if (useSendFileSet) {
-                log.warn(sm.getString("endpoint.apr.noSendfileWithSSL"));
-            }
-        }
-
-        if (negotiableProtocols.size() > 0) {
-            List<String> protocols = new ArrayList<>();
-            protocols.addAll(negotiableProtocols);
-            protocols.add("http/1.1");
-            String[] protocolsArray = protocols.toArray(new String[0]);
-            SSLContext.setAlpnProtos(ctx, protocolsArray, SSL.SSL_SELECTOR_FAILURE_NO_ADVERTISE);
-        }
-
-        // If client authentication is being used, OpenSSL requires that
-        // this is set so always set it in case an app is configured to require
-        // it
-        SSLContext.setSessionIdContext(ctx, SSLContext.DEFAULT_SESSION_ID_CONTEXT);
-
-        long cctx;
-        OpenSSLConf openSslConf = sslHostConfig.getOpenSslConf();
-        if (openSslConf != null) {
-            // Create OpenSSLConfCmd context if used
-            try {
-                if (log.isDebugEnabled())
-                    log.debug(sm.getString("endpoint.apr.makeConf"));
-                cctx = SSLConf.make(rootPool,
-                                    SSL.SSL_CONF_FLAG_FILE |
-                                    SSL.SSL_CONF_FLAG_SERVER |
-                                    SSL.SSL_CONF_FLAG_CERTIFICATE |
-                                    SSL.SSL_CONF_FLAG_SHOW_ERRORS);
-            } catch (Exception e) {
-                throw new Exception(sm.getString("endpoint.apr.errMakeConf"), e);
-            }
-            if (cctx != 0) {
-                // Check OpenSSLConfCmd if used
-                if (log.isDebugEnabled())
-                    log.debug(sm.getString("endpoint.apr.checkConf"));
-                try {
-                    if (!openSslConf.check(cctx)) {
-                        log.error(sm.getString("endpoint.apr.errCheckConf"));
-                        throw new Exception(sm.getString("endpoint.apr.errCheckConf"));
-                    }
-                } catch (Exception e) {
-                    throw new Exception(sm.getString("endpoint.apr.errCheckConf"), e);
-                }
-                // Apply OpenSSLConfCmd if used
-                if (log.isDebugEnabled())
-                    log.debug(sm.getString("endpoint.apr.applyConf"));
-                try {
-                    if (!openSslConf.apply(cctx, ctx)) {
-                        log.error(sm.getString("endpoint.apr.errApplyConf"));
-                        throw new Exception(sm.getString("endpoint.apr.errApplyConf"));
-                    }
-                } catch (Exception e) {
-                    throw new Exception(sm.getString("endpoint.apr.errApplyConf"), e);
-                }
-                // Reconfigure the enabled protocols
-                int opts = SSLContext.getOptions(ctx);
-                List<String> enabled = new ArrayList<>();
-                // Seems like there is no way to explicitly disable SSLv2Hello
-                // in OpenSSL so it is always enabled
-                enabled.add(Constants.SSL_PROTO_SSLv2Hello);
-                if ((opts & SSL.SSL_OP_NO_TLSv1) == 0) {
-                    enabled.add(Constants.SSL_PROTO_TLSv1);
-                }
-                if ((opts & SSL.SSL_OP_NO_TLSv1_1) == 0) {
-                    enabled.add(Constants.SSL_PROTO_TLSv1_1);
-                }
-                if ((opts & SSL.SSL_OP_NO_TLSv1_2) == 0) {
-                    enabled.add(Constants.SSL_PROTO_TLSv1_2);
-                }
-                if ((opts & SSL.SSL_OP_NO_SSLv2) == 0) {
-                    enabled.add(Constants.SSL_PROTO_SSLv2);
-                }
-                if ((opts & SSL.SSL_OP_NO_SSLv3) == 0) {
-                    enabled.add(Constants.SSL_PROTO_SSLv3);
-                }
-                sslHostConfig.setEnabledProtocols(
-                        enabled.toArray(new String[enabled.size()]));
-                // Reconfigure the enabled ciphers
-                sslHostConfig.setEnabledCiphers(SSLContext.getCiphers(ctx));
-            }
-        } else {
-            cctx = 0;
-        }
-
-        sslHostConfig.setOpenSslConfContext(Long.valueOf(cctx));
-        sslHostConfig.setOpenSslContext(Long.valueOf(ctx));
-    }
-
-
-    @Override
-    protected void releaseSSLContext(SSLHostConfig sslHostConfig) {
-        Long ctx = sslHostConfig.getOpenSslContext();
-        if (ctx != null && ctx.longValue() != 0L) {
-            SSLContext.free(ctx.longValue());
-            sslHostConfig.setOpenSslContext(null);
-        }
-        Long cctx = sslHostConfig.getOpenSslConfContext();
-        if (cctx != null && cctx.longValue() != 0L) {
-            SSLConf.free(cctx.longValue());
-            sslHostConfig.setOpenSslConfContext(null);
         }
     }
 
@@ -670,8 +453,10 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
             running = true;
             paused = false;
 
-            processorCache = new SynchronizedStack<>(SynchronizedStack.DEFAULT_SIZE,
-                    socketProperties.getProcessorCache());
+            if (socketProperties.getProcessorCache() != 0) {
+                processorCache = new SynchronizedStack<>(SynchronizedStack.DEFAULT_SIZE,
+                        socketProperties.getProcessorCache());
+            }
 
             // Create worker collection
             if (getExecutor() == null) {
@@ -692,7 +477,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
                 sendfile.start();
             }
 
-            startAcceptorThreads();
+            startAcceptorThread();
         }
     }
 
@@ -709,33 +494,27 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
             running = false;
             poller.stop();
             for (SocketWrapperBase<Long> socketWrapper : connections.values()) {
+                socketWrapper.close();
+            }
+            long waitLeft = 10000;
+            while (waitLeft > 0 &&
+                    acceptor.getState() != AcceptorState.ENDED &&
+                    serverSock != 0) {
                 try {
-                    socketWrapper.close();
-                } catch (IOException e) {
+                    Thread.sleep(50);
+                } catch (InterruptedException e) {
                     // Ignore
                 }
+                waitLeft -= 50;
             }
-            for (Acceptor<Long> acceptor : acceptors) {
-                long waitLeft = 10000;
-                while (waitLeft > 0 &&
-                        acceptor.getState() != AcceptorState.ENDED &&
-                        serverSock != 0) {
-                    try {
-                        Thread.sleep(50);
-                    } catch (InterruptedException e) {
-                        // Ignore
-                    }
-                    waitLeft -= 50;
-                }
-                if (waitLeft == 0) {
-                    log.warn(sm.getString("endpoint.warn.unlockAcceptorFailed",
-                            acceptor.getThreadName()));
-                   // If the Acceptor is still running force
-                   // the hard socket close.
-                   if (serverSock != 0) {
-                       Socket.shutdown(serverSock, Socket.APR_SHUTDOWN_READ);
-                       serverSock = 0;
-                   }
+            if (waitLeft == 0) {
+                log.warn(sm.getString("endpoint.warn.unlockAcceptorFailed",
+                        acceptor.getThreadName()));
+                // If the Acceptor is still running force
+                // the hard socket close.
+                if (serverSock != 0) {
+                    Socket.shutdown(serverSock, Socket.APR_SHUTDOWN_READ);
+                    serverSock = 0;
                 }
             }
             try {
@@ -754,7 +533,10 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
                 }
                 sendfile = null;
             }
-            processorCache.clear();
+            if (processorCache != null) {
+                processorCache.clear();
+                processorCache = null;
+            }
         }
         shutdownExecutor();
     }
@@ -776,15 +558,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
         }
 
         doCloseServerSocket();
-
-        if (sslContext != 0) {
-            Long ctx = Long.valueOf(sslContext);
-            SSLContext.unregisterDefault(ctx);
-            for (SSLHostConfig sslHostConfig : sslHostConfigs.values()) {
-                sslHostConfig.setOpenSslContext(null);
-            }
-            sslContext = 0;
-        }
+        destroySsl();
 
         // Close all APR memory pools and resources if initialised
         if (rootPool != 0) {
@@ -952,8 +726,14 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
      *         socket should be closed
      */
     protected boolean processSocket(long socket, SocketEvent event) {
-        SocketWrapperBase<Long> socketWrapper = connections.get(Long.valueOf(socket));
-        return processSocket(socketWrapper, event, true);
+        AprSocketWrapper socketWrapper = connections.get(Long.valueOf(socket));
+        if (event == SocketEvent.OPEN_READ && socketWrapper.readOperation != null) {
+            return socketWrapper.readOperation.process();
+        } else if (event == SocketEvent.OPEN_WRITE && socketWrapper.writeOperation != null) {
+            return socketWrapper.writeOperation.process();
+        } else {
+            return processSocket(socketWrapper, event, true);
+        }
     }
 
 
@@ -1542,9 +1322,17 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
                     log.debug(sm.getString("endpoint.debug.socketTimeout",
                             Long.valueOf(socket)));
                 }
-                SocketWrapperBase<Long> socketWrapper = connections.get(Long.valueOf(socket));
+                AprSocketWrapper socketWrapper = connections.get(Long.valueOf(socket));
                 socketWrapper.setError(new SocketTimeoutException());
-                processSocket(socketWrapper, SocketEvent.ERROR, true);
+                if (socketWrapper.readOperation != null || socketWrapper.writeOperation != null) {
+                    if (socketWrapper.readOperation != null) {
+                        socketWrapper.readOperation.process();
+                    } else {
+                        socketWrapper.writeOperation.process();
+                    }
+                } else {
+                    processSocket(socketWrapper, SocketEvent.ERROR, true);
+                }
                 socket = timeouts.check(date);
             }
 
@@ -1741,7 +1529,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
                                     // codes plus the flags it was waiting for or it may just
                                     // return an error code. We could handle the error here but
                                     // if we do, there will be no exception associated with the
-                                    // error in application code. By signalling read/write is
+                                    // error in application code. By signaling read/write is
                                     // possible, a read/write will be attempted, fail and that
                                     // will trigger an exception the application will see.
                                     // Check the return flags first, followed by what the socket
@@ -2112,7 +1900,9 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
                     maintainTime = 0;
                     try {
                         synchronized (this) {
-                            this.wait();
+                            if (sendfileRunning && sendfileCount < 1 && addS.size() < 1) {
+                                this.wait();
+                            }
                         }
                     } catch (InterruptedException e) {
                         // Ignore
@@ -2342,7 +2132,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
                 socketWrapper = null;
                 event = null;
                 //return to cache
-                if (running && !paused) {
+                if (running && !paused && processorCache != null) {
                     processorCache.push(this);
                 }
             }
@@ -2356,12 +2146,8 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
         private final ByteBuffer sslOutputBuffer;
 
-        private final Object closedLock = new Object();
-        private volatile boolean closed = false;
-
         // This field should only be used by Poller#run()
         private int pollerFlags = 0;
-
 
         public AprSocketWrapper(Long socket, AprEndpoint endpoint) {
             super(socket, endpoint);
@@ -2453,7 +2239,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
 
         private int fillReadBuffer(boolean block, ByteBuffer to) throws IOException {
-            if (closed) {
+            if (isClosed()) {
                 throw new IOException(sm.getString("socket.apr.closed", getSocket()));
             }
 
@@ -2550,27 +2336,22 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
 
         @Override
-        public void close() {
-            getEndpoint().getHandler().release(this);
-            synchronized (closedLock) {
-                // APR typically crashes if the same socket is closed twice so
-                // make sure that doesn't happen.
-                if (closed) {
-                    return;
+        protected void doClose() {
+            try {
+                getEndpoint().getHandler().release(this);
+            } catch (Throwable e) {
+                ExceptionUtils.handleThrowable(e);
+                if (log.isDebugEnabled()) {
+                    log.error(sm.getString("endpoint.debug.handlerRelease"), e);
                 }
-                closed = true;
+            }
+            socketBufferHandler = SocketBufferHandler.EMPTY;
+            nonBlockingWriteBuffer.clear();
+            synchronized (closed) {
                 if (sslOutputBuffer != null) {
                     ByteBufferUtils.cleanDirectBuffer(sslOutputBuffer);
                 }
                 ((AprEndpoint) getEndpoint()).getPoller().close(getSocket().longValue());
-            }
-        }
-
-
-        @Override
-        public boolean isClosed() {
-            synchronized (closedLock) {
-                return closed;
             }
         }
 
@@ -2628,7 +2409,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
         @Override
         protected void doWrite(boolean block, ByteBuffer from) throws IOException {
-            if (closed) {
+            if (isClosed()) {
                 throw new IOException(sm.getString("socket.apr.closed", getSocket()));
             }
 
@@ -2728,8 +2509,8 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
         @Override
         public void registerReadInterest() {
             // Make sure an already closed socket is not added to the poller
-            synchronized (closedLock) {
-                if (closed) {
+            synchronized (closed) {
+                if (isClosed()) {
                     return;
                 }
                 Poller p = ((AprEndpoint) getEndpoint()).getPoller();
@@ -2743,8 +2524,8 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
         @Override
         public void registerWriteInterest() {
             // Make sure an already closed socket is not added to the poller
-            synchronized (closedLock) {
-                if (closed) {
+            synchronized (closed) {
+                if (isClosed()) {
                     return;
                 }
                 ((AprEndpoint) getEndpoint()).getPoller().add(
@@ -2768,7 +2549,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
         @Override
         protected void populateRemoteAddr() {
-            if (closed) {
+            if (isClosed()) {
                 return;
             }
             try {
@@ -2783,7 +2564,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
         @Override
         protected void populateRemoteHost() {
-            if (closed) {
+            if (isClosed()) {
                 return;
             }
             try {
@@ -2801,7 +2582,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
         @Override
         protected void populateRemotePort() {
-            if (closed) {
+            if (isClosed()) {
                 return;
             }
             try {
@@ -2817,7 +2598,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
         @Override
         protected void populateLocalName() {
-            if (closed) {
+            if (isClosed()) {
                 return;
             }
             try {
@@ -2832,7 +2613,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
         @Override
         protected void populateLocalAddr() {
-            if (closed) {
+            if (isClosed()) {
                 return;
             }
             try {
@@ -2847,7 +2628,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
         @Override
         protected void populateLocalPort() {
-            if (closed) {
+            if (isClosed()) {
                 return;
             }
             try {
@@ -2931,8 +2712,8 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
         }
 
         String getSSLInfoS(int id) {
-            synchronized (closedLock) {
-                if (closed) {
+            synchronized (closed) {
+                if (isClosed()) {
                     return null;
                 }
                 try {
@@ -2944,8 +2725,8 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
         }
 
         int getSSLInfoI(int id) {
-            synchronized (closedLock) {
-                if (closed) {
+            synchronized (closed) {
+                if (isClosed()) {
                     return 0;
                 }
                 try {
@@ -2957,8 +2738,8 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
         }
 
         byte[] getSSLInfoB(int id) {
-            synchronized (closedLock) {
-                if (closed) {
+            synchronized (closed) {
+                if (isClosed()) {
                     return null;
                 }
                 try {
@@ -2968,5 +2749,115 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
                 }
             }
         }
+
+        @Override
+        protected <A> OperationState<A> newOperationState(boolean read,
+                ByteBuffer[] buffers, int offset, int length,
+                BlockingMode block, long timeout, TimeUnit unit, A attachment,
+                CompletionCheck check, CompletionHandler<Long, ? super A> handler,
+                Semaphore semaphore, VectoredIOCompletionHandler<A> completion) {
+            return new AprOperationState<>(read, buffers, offset, length, block,
+                    timeout, unit, attachment, check, handler, semaphore, completion);
+        }
+
+        private class AprOperationState<A>  extends OperationState<A> {
+            private volatile boolean inline = true;
+            private AprOperationState(boolean read, ByteBuffer[] buffers, int offset, int length,
+                    BlockingMode block, long timeout, TimeUnit unit, A attachment, CompletionCheck check,
+                    CompletionHandler<Long, ? super A> handler, Semaphore semaphore,
+                    VectoredIOCompletionHandler<A> completion) {
+                super(read, buffers, offset, length, block,
+                        timeout, unit, attachment, check, handler, semaphore, completion);
+            }
+
+            @Override
+            protected boolean isInline() {
+                return inline;
+            }
+
+            @Override
+            protected void start() {
+                run();
+            }
+
+            @Override
+            public void run() {
+                // Perform the IO operation
+                // Called from the poller to continue the IO operation
+                long nBytes = 0;
+                if (getError() == null) {
+                    try {
+                        synchronized (this) {
+                            if (!completionDone) {
+                                // This filters out same notification until processing
+                                // of the current one is done
+                                if (log.isDebugEnabled()) {
+                                    log.debug("Skip concurrent " + (read ? "read" : "write") + " notification");
+                                }
+                                return;
+                            }
+                            if (!read && flush(false)) {
+                                inline = false;
+                                registerWriteInterest();
+                                return;
+                            }
+                            // Find the buffer on which the operation will be performed (no vectoring with APR)
+                            ByteBuffer buffer = null;
+                            for (int i = 0; i < length; i++) {
+                                if (buffers[i + offset].hasRemaining()) {
+                                    buffer = buffers[i + offset];
+                                    break;
+                                }
+                            }
+                            if (buffer == null ) {
+                                // Nothing to do
+                                return;
+                            }
+                            if (read) {
+                                nBytes = read(false, buffer);
+                            } else {
+                                int remaining = buffer.remaining();
+                                writeNonBlockingDirect(buffer);
+                                nBytes = remaining - buffer.remaining();
+                                if (nBytes > 0) {
+                                    try {
+                                        if (flush(false)) {
+                                            registerWriteInterest();
+                                        }
+                                    } catch (IOException e) {
+                                        // Ignore, will be delayed to later
+                                    }
+                                }
+                            }
+                            if (nBytes != 0) {
+                                completionDone = false;
+                            }
+                        }
+                    } catch (IOException e) {
+                        setError(e);
+                    }
+                }
+                if (nBytes > 0) {
+                    // The bytes read are only updated in the completion handler
+                    completion.completed(Long.valueOf(nBytes), this);
+                } else if (nBytes < 0 || getError() != null) {
+                    IOException error = getError();
+                    if (error == null) {
+                        error = new EOFException();
+                    }
+                    completion.failed(error, this);
+                } else {
+                    // As soon as the operation uses the poller, it is no longer inline
+                    inline = false;
+                    if (read) {
+                        registerReadInterest();
+                    } else {
+                        registerWriteInterest();
+                    }
+                }
+            }
+
+        }
+
     }
 }

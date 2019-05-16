@@ -294,14 +294,6 @@
       value is 100.</p>
     </attribute>
 
-    <attribute name="acceptorThreadCount" required="false">
-      <p>The number of threads to be used to accept connections. Increase this
-      value on a multi CPU machine, although you would never really need more
-      than <code>2</code>. Also, with a lot of non keep alive connections, you
-      might want to increase this value as well. Default value is
-      <code>1</code>.</p>
-    </attribute>
-
     <attribute name="acceptorThreadPriority" required="false">
       <p>The priority of the acceptor threads. The threads used to accept
       new connections. The default value is <code>5</code> (the value of the
@@ -647,6 +639,12 @@
       system property.</p>
     </attribute>
 
+    <attribute name="useAsyncIO" required="false">
+      <p>(bool)Use this attribute to enable or disable usage of the
+      asynchronous IO API. The default value is <code>true</code> except when
+      using the APR connector due to low performance.</p>
+    </attribute>
+
   </attributes>
 
   </subsection>
@@ -732,18 +730,6 @@
     <p>The following attributes are specific to the NIO connector.</p>
 
     <attributes>
-
-      <attribute name="pollerThreadCount" required="false">
-        <p>(int)The number of threads to be used to run for the polling events.
-        Default value is <code>1</code> per processor but not more than 2.<br/>
-        When accepting a socket, the operating system holds a global lock. So the benefit of
-        going above 2 threads diminishes rapidly. Having more than one thread is for
-        system that need to accept connections very rapidly. However usually just
-        increasing <code>acceptCount</code> will solve that problem.
-        Increasing this value may also be beneficial when a large amount of send file
-        operations are going on.
-        </p>
-      </attribute>
 
       <attribute name="pollerThreadPriority" required="false">
         <p>(int)The priority of the poller threads.
@@ -868,6 +854,16 @@
         can decide to keep it or let it be GC'd. Use this option when the
         command line <code>org.apache.tomcat.util.net.NioSelectorShared</code>
         value is set to false. Default value is <code>-1</code> (unlimited).</p>
+      </attribute>
+
+      <attribute name="selectorPool.shared" required="false">
+        <p>(bool)Set this value to <code>false</code> if you wish to
+        use a selector for each thread. When you set it to <code>false</code>, you can
+        control the size of the pool of selectors by using the
+        <strong>selectorPool.maxSelectors</strong> attribute.
+        Default is <code>true</code> or the value of the
+        <code>org.apache.tomcat.util.net.NioSelectorShared</code> system
+        property if present.</p>
       </attribute>
 
       <attribute name="useInheritedChannel" required="false">
@@ -1318,14 +1314,12 @@
     </attribute>
 
     <attribute name="sessionCacheSize" required="false">
-      <p>JSSE only.</p>
       <p>The number of SSL sessions to maintain in the session cache. Use 0 to
       specify an unlimited cache size. If not specified, a default of 0 is
       used.</p>
     </attribute>
 
     <attribute name="sessionTimeout" required="false">
-      <p>JSSE only.</p>
       <p>The time, in seconds, after the creation of an SSL session that it will
       timeout. Use 0 to specify an unlimited timeout. If not specified, a
       default of 86400 (24 hours) is used.</p>
